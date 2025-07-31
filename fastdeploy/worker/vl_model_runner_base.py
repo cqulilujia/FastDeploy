@@ -21,10 +21,21 @@ import paddle
 import paddle.distributed as dist
 import paddle.distributed.fleet as fleet
 from fastdeploy.config import ModelConfig
-
+from fastdeploy.platforms import current_platform
 from fastdeploy.utils import get_logger
 
 logger = get_logger("worker", "worker.log")
+
+if current_platform.is_cuda():
+    from fastdeploy.model_executor.ops.gpu import (save_output,
+                                                set_stop_value_multi_ends,
+                                                set_value_by_flags_and_idx,
+                                                update_inputs)
+elif current_platform.is_xpu():
+    from fastdeploy.model_executor.ops.xpu import (save_output,
+                                               set_stop_value_multi_ends,
+                                               set_value_by_flags_and_idx,
+                                               update_inputs)
 
 
 class VLModelRunnerBase(ABC):

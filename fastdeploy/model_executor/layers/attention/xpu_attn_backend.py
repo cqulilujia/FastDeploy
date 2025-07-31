@@ -169,6 +169,12 @@ class XPUAttentionBackend(AttentionBackend):
         v_quant_scale = getattr(layer, "cache_v_scale", None)
 
         from fastdeploy.model_executor.ops.xpu import block_attn
+        print(f"----block_attn: qkv shape: {qkv.shape}")
+        if forward_meta.enc_batch[0] > 0:
+            print(f"@@ encoder @@ enc_batch = {forward_meta.enc_batch[0]}")
+        if forward_meta.dec_batch[0] > 0:
+            print(f"@@ decoder @@ dec_batch = {forward_meta.dec_batch[0]}")
+
         res = block_attn(
             qkv,
             forward_meta.caches[2 * layer.layer_id],
@@ -186,5 +192,7 @@ class XPUAttentionBackend(AttentionBackend):
             forward_meta.encoder_batch_map_cpu,
             forward_meta.decoder_context_len_cpu,
             forward_meta.decoder_batch_map_cpu,
+            forward_meta.pos_emb_type,
+            True
         )
         return res

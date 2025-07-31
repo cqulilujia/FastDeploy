@@ -20,6 +20,10 @@ export python=$PYTHON_VERSION
 FD_CPU_USE_BF16=${3:-"false"}
 FD_BUILDING_ARCS=${4:-""}
 
+export CLANG_PATH=/host/FastDeploy/xtdk
+export XVLLM_PATH=/host/baidu/xpu/vllm/output
+export http_proxy=agent.baidu.com:8891
+export https_proxy=agent.baidu.com:8891
 
 # paddle distributed use to set archs
 unset PADDLE_CUDA_ARCH_LIST
@@ -187,13 +191,13 @@ function version_info() {
   fastdeploy_git_commit_id=$(git rev-parse HEAD)
   paddle_version=$(${python} -c "import paddle; print(paddle.__version__)")
   paddle_git_commit_id=$(${python} -c "import paddle; print(paddle.__git_commit__)")
-  cuda_version=$(nvcc -V | grep -Po "(?<=release )[\d.]+(?=, V)")
+  # cuda_version=$(nvcc -V | grep -Po "(?<=release )[\d.]+(?=, V)")
   cxx_version=$(g++ --version | head -n 1 | grep -Po "(?<=\) )[\d.]+")
 
   echo "fastdeploy GIT COMMIT ID: $fastdeploy_git_commit_id" > $output_file
   echo "Paddle version: $paddle_version" >> $output_file
   echo "Paddle GIT COMMIT ID: $paddle_git_commit_id" >> $output_file
-  echo "CUDA version: $cuda_version" >> $output_file
+  # echo "CUDA version: $cuda_version" >> $output_file
   echo "CXX compiler version: $cxx_version" >> $output_file
 }
 

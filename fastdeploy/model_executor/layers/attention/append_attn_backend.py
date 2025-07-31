@@ -203,6 +203,12 @@ class AppendAttentionBackend(AttentionBackend):
                     metadata.kv_signal_metadata,
                     layer.layer_id + self.start_layer_index)
 
+        print(f"----append_attn: qkv shape: {qkv.shape}")
+        if metadata.set_max_lengths[1] > 0:
+            print(f"@@ encoder @@ max_enc_len = {metadata.set_max_lengths[1]}")
+        if metadata.set_max_lengths[2] > 0:
+            print(f"!! decoder !! max_dec_len = {metadata.set_max_lengths[2]}")
+
         res = append_attention(
             qkv,
             forward_meta.caches[2 * layer.layer_id],

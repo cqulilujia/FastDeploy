@@ -44,6 +44,10 @@ from fastdeploy.platforms import current_platform
 from fastdeploy.worker.forward_meta import ForwardMeta
 from fastdeploy.worker.utils import check_safetensors_model
 from fastdeploy.worker.vl_model_runner_base import VLModelRunnerBase
+from fastdeploy.worker.vl_model_runner_base import (save_output,
+                                                set_stop_value_multi_ends,
+                                                set_value_by_flags_and_idx,
+                                                update_inputs)
 from fastdeploy.config import (DeviceConfig, FDConfig, KVCacheConfig,
                                 LoadConfig, ModelConfig, MoEConfig,
                                 MoEPhase, ParallelConfig, SpeculativeConfig)
@@ -51,11 +55,6 @@ from fastdeploy.config import (DeviceConfig, FDConfig, KVCacheConfig,
 if current_platform.is_cuda() and current_platform.available():
     from fastdeploy.model_executor.layers.utils import (
         remove_padding, speculate_remove_padding)
-
-from fastdeploy.model_executor.ops.gpu import (save_output,
-                                               set_stop_value_multi_ends,
-                                               set_value_by_flags_and_idx,
-                                               update_inputs)
 
 
 class GPUVLModelRunner(VLModelRunnerBase):
@@ -73,6 +72,7 @@ class GPUVLModelRunner(VLModelRunnerBase):
         """
         GPUVLModelRunner init
         """
+        self.XPUModelRunner_cnt = 0
         self.nranks = nranks
         self.rank = rank
 
@@ -800,6 +800,7 @@ class GPUVLModelRunner(VLModelRunnerBase):
                     input_ids=self.share_inputs["input_ids"],
                     seq_lens_this_time=self.share_inputs["seq_lens_this_time"])
         self.share_inputs["ids_remove_padding"] = ids_remove_padding
+        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, ids_remove_padding 0: {self.share_inputs["ids_remove_padding"]}')
         self.share_inputs["padding_offset"] = padding_offset
         self.share_inputs["cum_offsets"] = cum_offsets
         self.share_inputs["cu_seqlens_q"] = cu_seqlens_q
@@ -832,10 +833,14 @@ class GPUVLModelRunner(VLModelRunnerBase):
         generate
         """
         self.pre_process()
-        hiddden_states = self.model(self.share_inputs["ids_remove_padding"],
+        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, ids_remove_padding 1: {self.share_inputs["ids_remove_padding"]}')
+        hidden_states = self.model(self.share_inputs["ids_remove_padding"],
                                     self.share_inputs["image_features"],
                                     self.forward_meta)
-        logits = self.model.compute_logits(hiddden_states)
+        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, hidden_states, max: {paddle.max(hidden_states)}, min: {paddle.min(hidden_states)}, mean: {paddle.mean(hidden_states)}')
+        logits = self.model.compute_logits(hidden_states)
+        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, logits, max: {paddle.max(logits)}, min: {paddle.min(logits)}, mean: {paddle.mean(logits)}')
+
         set_value_by_flags_and_idx(
             self.share_inputs["pre_ids"],
             self.share_inputs["input_ids"],
@@ -847,9 +852,16 @@ class GPUVLModelRunner(VLModelRunnerBase):
         )
         # sampler & save_output
         next_tokens = self.sampler(logits, self.sampling_metadata)
+        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, next_tokens 1, {next_tokens}')
+
         if self.fd_config.parallel_config.tensor_parallel_degree > 1:
             paddle.distributed.broadcast(next_tokens, 0)
+        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, ids_remove_padding 2: {self.share_inputs["ids_remove_padding"]}')
         self.post_process(next_tokens)
+        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, next_tokens 2: {self.share_inputs["next_tokens"]}')
+        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, ids_remove_padding 3: {self.share_inputs["ids_remove_padding"]}')
+        self.XPUModelRunner_cnt += 1
+
 
     def post_process(self, next_tokens: paddle.Tensor) -> None:
         """

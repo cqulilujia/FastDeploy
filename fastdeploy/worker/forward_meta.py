@@ -423,3 +423,6 @@ class XPUForwardMeta(ForwardMeta):
 
     #
     total_enc_len: Optional[paddle.Tensor] = None
+
+    #
+    pos_emb_type: Optional[str] = 'NORMAL'
