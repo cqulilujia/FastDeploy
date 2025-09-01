@@ -51,12 +51,13 @@ class XpuWorker(WorkerBase):
         """Initialize device and Construct model runner"""
         if paddle.is_compiled_with_xpu():
             # Set evironment variable
+            self.device_ids = self.parallel_config.device_ids.split(",")
             self.device = f"xpu:{self.local_rank}"
             paddle.device.set_device(self.device)
             paddle.set_default_dtype(self.parallel_config.dtype)
-            self.device_ids = self.parallel_config.device_ids.split(",")
 
             gc.collect()
+            paddle.device.xpu.empty_cache()
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
@@ -69,12 +70,11 @@ class XpuWorker(WorkerBase):
             local_rank=self.local_rank,
         )
 
-    def graph_optimize_and_warm_up_model(self) -> None:
+    def exist_prefill(self):
         """
-        Perform the warm-up and the graph optimization
+        check whether prefill stage exist
         """
-        if self.model_runner.graph_opt_level >= 1:
-            self.model_runner.sot_warmup()
+        return self.model_runner.exist_prefill()
 
     def determine_available_memory(self) -> int:
         """
@@ -113,9 +113,6 @@ class XpuWorker(WorkerBase):
         )
 
         # 2. Profile run
-        # self.model_runner.profile_run()
-        # set_random_seed(self.fd_config.model_config.seed)
-        self.model_runner.prepare_profile()
         self.model_runner.profile_run()
         set_random_seed(self.fd_config.model_config.seed)
 
@@ -133,22 +130,12 @@ class XpuWorker(WorkerBase):
         after_run_meminfo_total = paddle.device.xpu.memory_total(local_rank)
         after_run_meminfo_used = paddle.device.xpu.memory_used(local_rank)
         available_kv_cache_memory = (
-            after_run_meminfo_total * 0.999#self.cache_config.gpu_memory_utilization
+            after_run_meminfo_total * self.cache_config.gpu_memory_utilization
             - after_run_meminfo_used
             - paddle_peak_increase
         )
-        first = after_run_meminfo_total * 0.999#self.cache_config.gpu_memory_utilization
-        # logger.info(
-        #     f"\n first: {first}")
-        # logger.info(
-        #     f"\n second: {after_run_meminfo_used}")
-        # logger.info(
-        #     f"\n third: {paddle_peak_increase}")
-        # logger.info(
-        #     f"\n result: {available_kv_cache_memory}"
-        #     )
         available_kv_cache_memory += model_block_memory_used * self.parallel_config.total_block_num
-        logger.info(f"\n result_2: {available_kv_cache_memory}")
+
         end_time = time.perf_counter()
         logger.info(
             (
@@ -164,20 +151,17 @@ class XpuWorker(WorkerBase):
 
         return available_kv_cache_memory  # return to caculate the block num in this device
 
-    def cal_theortical_kvcache(self) -> int:
-        """ """
-        return self.model_runner.cal_theortical_kvcache()
-
     def load_model(self) -> None:
-        """ """
+        """Load model"""
         self.model_runner.load_model()
 
     def get_model(self) -> nn.Layer:
-        """ """
+        """Get current model"""
         return self.model_runner.get_model()
 
     def initialize_cache(self, num_gpu_blocks: int) -> None:
-        """ """
+        """Initizlize the KV Cache with accurate num_gpu_blocks"""
+        # accurate cache size
         self.model_runner.update_share_input_block_num(num_gpu_blocks=num_gpu_blocks)
 
     def execute_model(
@@ -192,12 +176,6 @@ class XpuWorker(WorkerBase):
 
         return output
 
-    def exist_prefill(self):
-        """
-        check whether prefill stage exist
-        """
-        return self.model_runner.exist_prefill()
-
     def preprocess_new_task(self, req_dicts: List[Request], num_running_requests: int = -1) -> None:
         """Process new requests and then start the decode loop
         TODO(gongshaotian):The scheduler should schedule the handling of prefill,
@@ -208,6 +186,17 @@ class XpuWorker(WorkerBase):
         else:
             self.model_runner.process_prefill_inputs(req_dicts=req_dicts)
 
+    def graph_optimize_and_warm_up_model(self) -> None:
+        """
+        Perform the warm-up and the graph optimization
+        """
+        if self.model_runner.graph_opt_level >= 1:
+            self.model_runner.sot_warmup()
+
     def check_health(self) -> bool:
         """ """
         return True
+
+    def cal_theortical_kvcache(self) -> int:
+        """Calculate the block memory required"""
+        return self.model_runner.cal_theortical_kvcache()

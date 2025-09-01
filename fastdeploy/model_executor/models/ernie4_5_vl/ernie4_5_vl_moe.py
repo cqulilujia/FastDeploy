@@ -54,7 +54,6 @@ if current_platform.is_cuda():
     )
 elif current_platform.is_xpu():
     from fastdeploy.model_executor.ops.xpu import (
-        extract_text_token_output,
         text_image_gather_scatter,
         text_image_index_out,
     )
@@ -466,14 +465,12 @@ class Ernie4_5_VLModel(nn.Layer):
         fake_hidden_states = None
 
         hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
-        print(f'Ernie4_5_VLModel hidden_states, max: {paddle.max(hidden_states)}, min: {paddle.min(hidden_states)}, mean: {paddle.mean(hidden_states)}')
         token_num, hidden_dim = hidden_states.shape
 
         # -----------------------
         image_mask = ids_remove_padding == self.im_patch_id
         image_token_num = image_mask.sum()
         text_token_num = paddle.maximum((token_num - image_token_num), paddle.ones([], dtype="int64"))
-        print(f'Ernie4_5_VLModel text_token_num, max: {paddle.max(text_token_num)}, min: {paddle.min(text_token_num)}, mean: {paddle.mean(text_token_num)}')
 
         token_type_ids = image_mask.cast("int32")
         if self.fd_config.parallel_config.use_ep is True:
@@ -515,7 +512,6 @@ class Ernie4_5_VLModel(nn.Layer):
                 residual,
                 vl_moe_meta,
             )
-            print(f'Ernie4_5_VLModel layer[{i}] hidden_states, max: {paddle.max(hidden_states)}, min: {paddle.min(hidden_states)}, mean: {paddle.mean(hidden_states)}')
 
         hidden_states = hidden_states + residual
 
@@ -525,26 +521,16 @@ class Ernie4_5_VLModel(nn.Layer):
             if image_input is not None:
                 forward_meta.token_type_ids = token_type_ids
         else:
-            hidden_states = hidden_states.cast("float32")
-            score_text = hidden_states
-
-            if image_input is not None:
-                token_type_ids = token_type_ids.reshape([-1])
-                text_pos_shifted = token_type_ids[:token_num] == 0
-                score_text = hidden_states[text_pos_shifted.reshape([-1])]
-
-            max_seq_len, max_seq_len_index = paddle.topk(
-                forward_meta.seq_lens_this_time.squeeze(-1), k=1)
+            max_seq_len, max_seq_len_index = paddle.topk(forward_meta.seq_lens_this_time, k=1)
             hidden_states = extract_text_token_output(
                 max_seq_len,
                 max_seq_len_index.cast("int32"),
-                image_token_num,
+                image_token_num.cast("int32"),
                 forward_meta.seq_lens_this_time,
                 forward_meta.cu_seqlens_q,
-                score_text,
-            )[0].cast(self._dtype)
+                hidden_states.cast("float32"),
+            ).cast(self._dtype)
         # -----------------------
-        print(f'Ernie4_5_VLModel extract_text_token_output hidden_states, max: {paddle.max(hidden_states)}, min: {paddle.min(hidden_states)}, mean: {paddle.mean(hidden_states)}')
 
         out = self.norm(hidden_states)
 

@@ -24,7 +24,7 @@ import paddle
 from paddle import nn
 
 from fastdeploy import envs
-from fastdeploy.input.mm_processor import DataProcessor
+from fastdeploy.input.ernie4_5_vl_processor import DataProcessor
 from fastdeploy.config import FDConfig
 from fastdeploy.engine.request import Request, RequestType
 from fastdeploy.model_executor.forward_meta import ForwardMeta, XPUForwardMeta
@@ -68,7 +68,7 @@ def xpu_pre_process(
 ) -> XPUForwardMeta:
     """ """
     max_len = input_ids.shape[1]
-    cum_offsets_now = paddle.cumsum(max_len - seq_lens_this_time)
+    cum_offsets_now = paddle.cumsum(max_len - seq_lens_this_time, dtype=paddle.int32)
     token_num = paddle.sum(seq_lens_this_time)
 
     (
@@ -388,7 +388,6 @@ class XPUModelRunner(ModelRunnerBase):
         self.rank = rank
         self.local_rank = local_rank
         self.enable_early_stop = self.fd_config.early_stop_config.enable_early_stop
-        self.XPUModelRunner_cnt = 0
 
         # VL model config:
         if self.enable_mm:
@@ -434,18 +433,28 @@ class XPUModelRunner(ModelRunnerBase):
         ).cpu()
 
         # Initialize attention Backend
-        # Note(gonshaotian): Currently, all attention layers share one attention backend instance.
+        # NOTE(gonshaotian): Currently, all attention layers share one attention backend instance.
         # In the future, we will expand it as a list.
         self.attn_backends: list[AttentionBackend] = []
-
         self.initialize_attn_backend()
 
         # Forward meta store the global meta information of the forward
         self.forward_meta: ForwardMeta = None
 
+    def exist_prefill(self):
+        """
+        check whether prefill stage exist
+        """
+        if int(paddle.max(self.share_inputs["seq_lens_encoder"])) != 0:
+            return 1
+        else:
+            return 0
+
     def insert_tasks_v1(self, req_dicts: List[Request]):
         """
         Process scheduler output tasks, used when ENABLE_V1_KVCACHE_SCHEDULER=1
+        req_dict: A list of Request dict
+        num_running_requests: batch_size
         """
         # NOTE(luotingdan): Lazy initialize kv cache
         if "caches" not in self.share_inputs:
@@ -453,11 +462,11 @@ class XPUModelRunner(ModelRunnerBase):
 
         req_len = len(req_dicts)
         has_prefill_task = False
+        has_decode_task = False
         for i in range(req_len):
             request = req_dicts[i]
             idx = request.idx
             if request.task_type.value == RequestType.PREFILL.value:  # prefill task
-                logger.debug(f"Handle prefill request {request} at idx {idx}")
                 prefill_start_index = request.prefill_start_index
                 prefill_end_index = request.prefill_end_index
                 length = prefill_end_index - prefill_start_index
@@ -502,8 +511,15 @@ class XPUModelRunner(ModelRunnerBase):
                         position_ids, request.get("max_tokens", 2048)
                     )
 
-
-                input_ids = request.prompt_token_ids + request.output_token_ids
+                if len(request.output_token_ids) == 0:
+                    input_ids = request.prompt_token_ids
+                else:
+                    input_ids = request.prompt_token_ids + request.output_token_ids
+                logger.debug(
+                    f"Handle prefill request {request} at idx {idx}, "
+                    f"{prefill_start_index=}, {prefill_end_index=}, "
+                    f"need_prefilled_token_num={len(input_ids)}"
+                )
                 self.share_inputs["input_ids"][idx : idx + 1, :length] = np.array(
                     input_ids[prefill_start_index:prefill_end_index]
                 )
@@ -581,12 +597,17 @@ class XPUModelRunner(ModelRunnerBase):
             if request.get("stop_token_ids") is not None and request.get("stop_seqs_len") is not None:
                 stop_seqs_num = len(request.get("stop_seqs_len"))
                 for i in range(stop_seqs_num, self.model_config.max_stop_seqs_num):
-                    request.stop_seqs_len.append(0)
-                self.share_inputs["stop_seqs_len"][:] = np.array(request.stop_seqs_len, dtype="int32")
-                self.share_inputs["stop_seqs"][:stop_seqs_num, : len(request.get("stop_token_ids")[0])] = np.array(
-                    request.get("stop_token_ids"), dtype="int64"
+                    request.sampling_params.stop_seqs_len.append(0)
+                self.share_inputs["stop_seqs_len"][idx : idx + 1, :] = np.array(
+                    request.sampling_params.stop_seqs_len, dtype="int32"
                 )
-        if has_prefill_task:
+                self.share_inputs["stop_seqs"][
+                    idx : idx + 1, :stop_seqs_num, : len(request.get("stop_token_ids")[0])
+                ] = np.array(request.get("stop_token_ids"), dtype="int64")
+            else:
+                self.share_inputs["stop_seqs_len"][idx : idx + 1, :] = 0
+
+        if has_prefill_task or has_decode_task:
             self.share_inputs["not_need_stop"][0] = True
 
     def process_prefill_inputs(self, req_dicts: List[Request]):
@@ -595,7 +616,10 @@ class XPUModelRunner(ModelRunnerBase):
         for i in range(req_len):
             request = req_dicts[i]
             idx = request.idx
-            length = request.prompt_token_ids_len
+            length = len(request.prompt_token_ids)
+            assert length > 0, "The prompt requested must not be empty."
+            self.share_inputs["pre_ids"][idx : idx + 1] = -1
+            self.share_inputs["step_idx"][idx : idx + 1] = 0
             self.share_inputs["input_ids"][idx : idx + 1, :length] = np.array(request.prompt_token_ids)
             self.share_inputs["prompt_ids"][idx : idx + 1, :length] = np.array(request.prompt_token_ids)
             if self.enable_mm:
@@ -609,8 +633,13 @@ class XPUModelRunner(ModelRunnerBase):
                 length = inputs["input_ids"].shape[1]
                 self.share_inputs["input_ids"][idx : idx + 1, :length] = inputs["input_ids"]
             else:
-                self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
-                self.share_inputs["step_seq_lens_decoder"][idx : idx + 1] = 0
+                self.share_inputs["seq_lens_decoder"][idx : idx + 1] = request.get("seq_lens_decoder", 0)
+                self.share_inputs["step_seq_lens_decoder"][idx : idx + 1] = request.get("seq_lens_decoder", 0)
+            self.share_inputs["seq_lens_this_time"][idx : idx + 1] = length
+            self.share_inputs["step_seq_lens_encoder"][idx : idx + 1] = length
+            self.share_inputs["seq_lens_encoder"][idx : idx + 1] = length
+            self.share_inputs["prompt_lens"][idx : idx + 1] = length
+
             if self.enable_mm:
                 enable_thinking = request.get("enable_thinking", True)
                 enable_thinking = enable_thinking if enable_thinking is not None else True
@@ -621,25 +650,33 @@ class XPUModelRunner(ModelRunnerBase):
                     position_ids, request.get("max_tokens", 2048)
                 )
                 self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
+
+            def get_attr_from_request(request, attr, default_value=None):
+                res = request.get(attr, default_value)
+                if res is not None:
+                    return res
+                else:
+                    return default_value
+
             assert len(request.eos_token_ids) == self.model_config.eos_tokens_lens
             self.share_inputs["eos_token_id"][:] = np.array(request.eos_token_ids, dtype="int64").reshape(-1, 1)
-            self.share_inputs["pre_ids"][idx : idx + 1] = -1
-            self.share_inputs["top_p"][idx : idx + 1] = request.get("top_p", 0.7)
+            self.share_inputs["top_p"][idx : idx + 1] = get_attr_from_request(request, "top_p", 0.7)
             self.share_inputs["top_k"][idx : idx + 1] = request.get("top_k", 0)
             self.share_inputs["top_k_list"][idx] = request.get("top_k", 0)
             self.share_inputs["min_p"][idx : idx + 1] = request.get("min_p", 0.0)
             self.share_inputs["min_p_list"][idx] = request.get("min_p", 0.0)
-            self.share_inputs["temperature"][idx : idx + 1] = request.get("temperature", 0.95)
-            self.share_inputs["penalty_score"][idx : idx + 1] = request.get("repetition_penalty", 1.0)
-            self.share_inputs["frequency_score"][idx : idx + 1] = request.get("frequency_penalty", 0.0)
-            self.share_inputs["presence_score"][idx : idx + 1] = request.get("presence_penalty", 0.0)
-            self.share_inputs["seq_lens_this_time"][idx : idx + 1] = length
-            self.share_inputs["step_seq_lens_encoder"][idx : idx + 1] = length
-            self.share_inputs["seq_lens_encoder"][idx : idx + 1] = length
-            
-            self.share_inputs["step_idx"][idx : idx + 1] = 0
-            self.share_inputs["min_dec_len"][idx : idx + 1] = request.get("min_tokens", 1)
 
+            self.share_inputs["temperature"][idx : idx + 1] = get_attr_from_request(request, "temperature", 0.95)
+            self.share_inputs["penalty_score"][idx : idx + 1] = get_attr_from_request(
+                request, "repetition_penalty", 1.0
+            )
+            self.share_inputs["frequency_score"][idx : idx + 1] = get_attr_from_request(
+                request, "frequency_penalty", 0.0
+            )
+            self.share_inputs["presence_score"][idx : idx + 1] = get_attr_from_request(
+                request, "presence_penalty", 0.0
+            )
+            self.share_inputs["min_dec_len"][idx : idx + 1] = request.get("min_tokens", 1)
             self.share_inputs["max_dec_len"][idx : idx + 1] = request.get(
                 "max_tokens", self.model_config.max_model_len
             )
@@ -803,21 +840,22 @@ class XPUModelRunner(ModelRunnerBase):
 
         if self.enable_mm:
             head_dim = self.model_config.head_dim
-            self.share_inputs["rope_emb"] = paddle.full(shape=[
-                    max_num_seqs, 2, 1, self.parallel_config.max_model_len, 1, head_dim // 2
-                    ],
-                    fill_value=0,
-                    dtype="float32")
+            self.share_inputs["rope_emb"] = paddle.full(
+                shape=[
+                    max_num_seqs,
+                    2,
+                    1,
+                    self.parallel_config.max_model_len,
+                    1,
+                    head_dim // 2,
+                ],
+                fill_value=0,
+                dtype="float32",
+            )
             self.share_inputs["image_features"] = None
-            self.share_inputs["need_think_end"] = paddle.full(shape=[max_num_seqs, 1],
-                                                    fill_value=0,
-                                                    dtype="int32")
-            self.share_inputs["enable_thinking"] = paddle.full(shape=[1],
-                                                    fill_value=True,
-                                                    dtype="bool")
-            self.share_inputs["reasoning_index"] = paddle.full(shape=[max_num_seqs, 1],
-                                                    fill_value=0,
-                                                    dtype="int32")
+            self.share_inputs["need_think_end"] = paddle.full(shape=[max_num_seqs, 1], fill_value=0, dtype="int32")
+            self.share_inputs["enable_thinking"] = paddle.full(shape=[1], fill_value=True, dtype="bool")
+            self.share_inputs["reasoning_index"] = paddle.full(shape=[max_num_seqs, 1], fill_value=0, dtype="int32")
 
 
     def _prepare_inputs(self, is_dummy_run=False) -> None:
@@ -845,6 +883,8 @@ class XPUModelRunner(ModelRunnerBase):
         # Update bad tokens len
         max_bad_tokens_len = paddle.max(self.share_inputs["bad_tokens_len"])
 
+        if self.enable_mm:
+            self.forward_meta.pos_emb_type = "HALF_HEAD_DIM"
         self.forward_meta.attn_backend = self.attn_backends[0]
         self.initialize_attention_backend()
 
@@ -884,7 +924,7 @@ class XPUModelRunner(ModelRunnerBase):
         # 3. Load drafter model(for speculative decoding)
 
     def get_model(self) -> nn.Layer:
-        """get current model"""
+        """Get current model"""
         return self.model
 
     def initialize_attention_backend(self):
@@ -902,6 +942,7 @@ class XPUModelRunner(ModelRunnerBase):
         cache_kvs = {}
         max_block_num = self.num_gpu_blocks
 
+        # Get kv cache dtype
         cache_type = self.parallel_config.dtype
 
         kv_cache_quant_type = None
@@ -961,33 +1002,6 @@ class XPUModelRunner(ModelRunnerBase):
             )
         self.attn_backends.append(attn_backend)
 
-    def capture_model(self) -> None:
-        """
-        Trigger CUDA Graph capture for all shapes in 'CudaGraphConfig.cudagraph_capture_sizes'
-        """
-        logger.warn("XPU not support cuda graph currently")
-        pass
-
-    @sot_warmup_guard(True)
-    def sot_warmup(self) -> None:
-        start_time = time.perf_counter()
-        for batch_size in self.sot_warmup_sizes:
-            self._dummy_run(
-                num_tokens=self.parallel_config.max_num_batched_tokens,
-                batch_size=batch_size,
-            )
-            logger.info(f"SOT warmup the model with the batch size:{batch_size}")
-        logger.info(f"SOT warmup took {time.perf_counter() - start_time} seconds")
-
-    def exist_prefill(self):
-        """
-        check whether prefill stage exist
-        """
-        if int(paddle.max(self.share_inputs["seq_lens_encoder"])) != 0:
-            return 1
-        else:
-            return 0
-
     def _dummy_prefill_inputs(self, num_tokens: int, batch_size: int):
         """Set dummy prefill inputs to share_inputs"""
         full_length = min(num_tokens // batch_size, self.parallel_config.max_model_len - 10)
@@ -1037,6 +1051,24 @@ class XPUModelRunner(ModelRunnerBase):
 
             if int((self.share_inputs["seq_lens_this_time"] > 0).sum()) == 0:
                 break
+    def capture_model(self) -> None:
+        """
+        Trigger CUDA Graph capture for all shapes in 'CudaGraphConfig.cudagraph_capture_sizes'
+        """
+        logger.warn("XPU not support cuda graph currently")
+        pass
+
+    @sot_warmup_guard(True)
+    def sot_warmup(self) -> None:
+        start_time = time.perf_counter()
+        for batch_size in self.sot_warmup_sizes:
+            self._dummy_run(
+                num_tokens=self.parallel_config.max_num_batched_tokens,
+                batch_size=batch_size,
+            )
+            logger.info(f"SOT warmup the model with the batch size:{batch_size}")
+        logger.info(f"SOT warmup took {time.perf_counter() - start_time} seconds")
+
 
     def execute_model(
         self,
@@ -1059,31 +1091,27 @@ class XPUModelRunner(ModelRunnerBase):
         # 2. Padding inputs for cuda grph
 
         # 3. Execute model
-        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, ids_remove_padding 1: {self.share_inputs["ids_remove_padding"]}')
-        # print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, image_features: {self.share_inputs["image_features"]}')
         if self.enable_mm:
             model_output = self.model(self.share_inputs["ids_remove_padding"],
                                                         self.share_inputs["image_features"],
                                                         self.forward_meta)
-            hidden_states = model_output
         else:
             model_output = self.model(
                 ids_remove_padding=self.share_inputs["ids_remove_padding"],
-                forward_meta=self.forward_meta)
+                forward_meta=self.forward_meta,
+            )
 
-            hidden_states = xpu_process_output(model_output, self.share_inputs["cum_offsets"], self.forward_meta)
+        hidden_states = xpu_process_output(model_output, self.share_inputs["cum_offsets"], self.forward_meta)
 
-        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, hidddn_states, max: {paddle.max(hidden_states)}, min: {paddle.min(hidden_states)}, mean: {paddle.mean(hidden_states)}')
         # 4. Compute logits, Sample
         logits = self.model.compute_logits(hidden_states)
-        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, logits, max: {paddle.max(logits)}, min: {paddle.min(logits)}, mean: {paddle.mean(logits)}')
-
         sampler_output = self.sampler(logits, self.sampling_metadata)
+
+        
 
         # 5. Speculative decode
 
         # 6. Post Process
-        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, next_tokens 1: {self.share_inputs["next_tokens"][0]}')
         model_output_data = ModelOutputData(
             next_tokens=self.share_inputs["next_tokens"],
             stop_flags=self.share_inputs["stop_flags"],
@@ -1098,11 +1126,12 @@ class XPUModelRunner(ModelRunnerBase):
             seq_lens_encoder=self.share_inputs["seq_lens_encoder"],
             seq_lens_decoder=self.share_inputs["seq_lens_decoder"],
             is_block_step=self.share_inputs["is_block_step"],
+            # 投机解码
+            full_hidden_states=None,
             msg_queue_id=self.parallel_config.msg_queue_id,
             mp_rank=self.local_rank,
             use_ep=self.parallel_config.use_ep,
-            # 投机解码
-            full_hidden_states=None,
+
             draft_tokens=None,
             actual_draft_token_num=None,
             accept_tokens=None,
@@ -1112,7 +1141,7 @@ class XPUModelRunner(ModelRunnerBase):
             need_think_end=(self.share_inputs["need_think_end"][:num_running_requests] if self.enable_mm else None),
             reasoning_index=(self.share_inputs["reasoning_index"][:num_running_requests] if self.enable_mm else None),
             stop_token_ids=self.share_inputs["stop_seqs"],
-            stop_seqs_len=self.share_inputs["stop_seqs_len"]
+            stop_seqs_len=self.share_inputs["stop_seqs_len"],
         )
         xpu_post_process(
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -1121,7 +1150,6 @@ class XPUModelRunner(ModelRunnerBase):
             block_size=self.parallel_config.block_size,
             skip_save_output=is_dummy_run,
         )
-        print(f'self.XPUModelRunner_cnt: {self.XPUModelRunner_cnt}, next_tokens 2: {self.share_inputs["next_tokens"][0]}')
 
         # 7. Updata 'infer_seed' and step_paddle()
         self.share_inputs["infer_seed"].add_(self.infer_seed_increment)
@@ -1131,7 +1159,6 @@ class XPUModelRunner(ModelRunnerBase):
             self.cache_config.block_size,
             self.cache_config.enc_dec_block_num,
         )
-        self.XPUModelRunner_cnt += 1
 
         return None
 
@@ -1143,54 +1170,15 @@ class XPUModelRunner(ModelRunnerBase):
 
     @profile_run_guard(True)
     def profile_run(self) -> None:
-        """Execute a forward pass with dummy inputs to profile the memory usage of the model."""
+        """Execute a forward pass with dummy inputs to profile the memory usage of the model"""
+
+        self.num_gpu_blocks = self.parallel_config.total_block_num
+        self.initialize_kv_cache()
 
         self._dummy_run(
             num_tokens=int(self.parallel_config.max_num_batched_tokens),
             batch_size=min(self.parallel_config.max_num_seqs, 1),
         )
-
-    def clear_block_table(self) -> None:
-        """
-        Clear the block tables and kv cache after profiling.
-        """
-        del self.share_inputs["caches"]
-        if self.forward_meta is not None:
-            del self.forward_meta.caches
-        paddle.device.xpu.empty_cache()
-
-    def cal_theortical_kvcache(self):
-        """
-        Calculate the total block memory required at the model level
-        TODO(gongshaotian): Move to Attention Backend
-        """
-        """
-        Byte of dtype:
-        - default(bf16): 2
-        - cache_int8: 1
-        - cache_int4:
-        """
-        cache_quant_dtype = None
-        if (
-            self.quant_config
-            and hasattr(self.quant_config, "kv_cache_quant_type")
-            and self.quant_config.kv_cache_quant_type is not None
-        ):
-            cache_quant_dtype = self.quant_config.kv_cache_quant_type
-
-        if cache_quant_dtype is not None:  # int8, int8_zp, fp8, fp8_zp
-            byte_of_dtype = 1
-        else:  # default
-            byte_of_dtype = 2
-
-        hidden_dim = self.model_config.head_dim * self.model_config.kv_num_heads
-        required_memory = (
-            byte_of_dtype
-            * 2  # k + v
-            * (self.cache_config.block_size * hidden_dim)
-            * self.model_config.num_hidden_layers
-        )
-        return required_memory
 
     def update_share_input_block_num(self, num_gpu_blocks: int) -> None:
         """
@@ -1219,9 +1207,44 @@ class XPUModelRunner(ModelRunnerBase):
             }
         )
 
+    def cal_theortical_kvcache(self):
+        """
+        Calculate the total block memory required at the model level
+        TODO(gongshaotian): Move to Attention Backend
+        """
+        """
+        Byte of dtype:
+        - default(bf16): 2
+        - cache_int8: 1
+        - cache_int4:
+        """
+        cache_quant_dtype = None
+        if (
+            self.quant_config
+            and hasattr(self.quant_config, "kv_cache_quant_type")
+            and self.quant_config.kv_cache_quant_type is not None
+        ):
+            cache_quant_dtype = self.quant_config.kv_cache_quant_type
+
+        if cache_quant_dtype is not None:  # int8, int8_zp, fp8, fp8_zp
+            byte_of_dtype = 1
+        else:  # default
+            byte_of_dtype = 2
+
+        hidden_dim = self.model_config.head_dim * self.model_config.kv_num_heads
+        num_layers = self.model_config.num_hidden_layers
+        required_memory = byte_of_dtype * 2 * (self.cache_config.block_size * hidden_dim) * num_layers  # k + v
+        return required_memory
+
     def not_need_stop(self) -> bool:
-        """ """
+        """Stop decoding if the tensor meets the termination condition"""
         return self.share_inputs["not_need_stop"][0]
+
+    def clear_cache(self):
+        """Clear cached data from shared inputs and forward metadata"""
+        self.share_inputs.pop("caches", None)
+        if self.forward_meta is not None:
+            self.forward_meta.clear_caches()
 
     def _init_image_preprocess(self) -> None:
         processor = DataProcessor(
